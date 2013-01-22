@@ -1,4 +1,5 @@
 from StringIO import StringIO
+from weakref import WeakKeyDictionary
 
 from urlparse import urlparse, urlunparse
 from urllib import urlencode
@@ -12,12 +13,31 @@ from twisted.web.client import (
     HTTPConnectionPool,
     RedirectAgent,
     ContentDecoderAgent,
-    GzipDecoder
+    GzipDecoder,
+    CookieAgent
 )
 
 from twisted.python.components import registerAdapter
 
 from treq.auth import add_auth
+
+from cookielib import CookieJar
+from treq._cookies import cookiejar_from_dict
+
+
+_cookie_jars = WeakKeyDictionary()
+
+
+def cookies(response):
+    jar = cookiejar_from_dict({})
+
+    resp_jar = _cookie_jars.get(response, None)
+
+    if resp_jar is not None:
+        for cookie in resp_jar:
+            jar.set_cookie(cookie)
+
+    return jar
 
 
 def _flatten_param_dict(params):
@@ -62,8 +82,9 @@ registerAdapter(_from_file, StringIO, IBodyProducer)
 
 
 class HTTPClient(object):
-    def __init__(self, agent):
+    def __init__(self, agent, cookiejar=None):
         self._agent = agent
+        self._cookiejar = cookiejar
 
     @classmethod
     def with_config(cls, **kwargs):
@@ -77,6 +98,20 @@ class HTTPClient(object):
                 reactor,
                 persistent=kwargs.get('persistent', True)))
 
+        cookiejar = None
+        cookies = kwargs.get('cookies')
+
+        if cookies:
+            if isinstance(cookies, dict):
+                cookiejar = cookiejar_from_dict(cookies)
+            elif isinstance(cookies, CookieJar):
+                cookiejar = cookies
+
+        if cookiejar is None:
+            cookiejar = CookieJar()
+
+        agent = CookieAgent(agent, cookiejar)
+
         if kwargs.get('allow_redirects', True):
             agent = RedirectAgent(agent)
 
@@ -86,7 +121,7 @@ class HTTPClient(object):
         if auth:
             agent = add_auth(agent, auth)
 
-        return cls(agent)
+        return cls(agent, cookiejar=cookiejar)
 
     def get(self, url, **kwargs):
         return self.request('GET', url, **kwargs)
@@ -140,5 +175,12 @@ class HTTPClient(object):
 
         d = self._agent.request(
             method, url, headers=headers, bodyProducer=bodyProducer)
+
+        if self._cookiejar is not None:
+            def _add_cookies(resp):
+                _cookie_jars[resp] = self._cookiejar
+                return resp
+
+            d.addCallback(_add_cookies)
 
         return d
